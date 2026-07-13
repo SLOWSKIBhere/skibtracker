@@ -1,94 +1,131 @@
+"""
+skibtracker v2 — World Cup 2026 Semi/Final goal + red card tracker
+API: worldcup26.ir — no key needed
+Fires on: goals, own goals, penalties, red cards only. Silent otherwise.
+"""
+
 import requests
 from datetime import datetime, timezone
 
 API_BASE = "https://worldcup26.ir"
 
-# Match IDs for semis + final (based on tournament bracket)
-TARGET_MATCHES = {
-    "Semi-Final 1": {"date": "2026-07-14", "kickoff_et": "19:00"},
-    "Semi-Final 2": {"date": "2026-07-15", "kickoff_et": "19:00"},
-    "Final":        {"date": "2026-07-19", "kickoff_et": "15:00"},
-}
+TARGET_TYPES = {"sf", "final", "third"}  # semi-finals, final, 3rd place
 
-def get_all_games():
+def get_games():
     r = requests.get(f"{API_BASE}/get/games", timeout=10)
     r.raise_for_status()
-    return r.json()
+    data = r.json()
+    if isinstance(data, list):
+        return data
+    return data.get('data', data.get('games', data.get('matches', [])))
 
-def find_target_games(games):
-    results = []
-    for game in games:
-        stage = game.get("stage", "").lower()
-        if any(k in stage for k in ["semi", "final"]):
-            results.append(game)
-    return results
+def parse_scorers(raw):
+    """Parse scorer string like: {\"Mbappé 45'\",\"Dembélé 66'\"} into list"""
+    if not raw or raw in ('null', 'NULL', '', None):
+        return []
+    # Strip outer braces and split by comma within quotes
+    import re
+    return re.findall(r'"([^"]+)"', str(raw))
 
-def format_event_update(game):
-    home = game.get("home_team", {}).get("name", "TBD")
-    away = game.get("away_team", {}).get("name", "TBD")
-    home_score = game.get("home_score", 0)
-    away_score = game.get("away_score", 0)
-    stage = game.get("stage", "Match")
-    status = game.get("status", "scheduled")
-    minute = game.get("minute", "")
+def format_alert(game, prev_home_score, prev_away_score):
+    """Build a WhatsApp-safe alert for new events in this game."""
+    home = game.get('home_team_name_en', 'TBD')
+    away = game.get('away_team_name_en', 'TBD')
+    hs = int(game.get('home_score', 0) or 0)
+    as_ = int(game.get('away_score', 0) or 0)
+    gtype = game.get('type', '').upper()
+    finished = str(game.get('finished', '')).upper() == 'TRUE'
 
-    events = game.get("events", [])
-    goals = [e for e in events if e.get("type") in ["goal", "own_goal", "penalty"]]
-    cards = [e for e in events if e.get("type") in ["red_card", "yellow_red_card"]]
+    home_scorers = parse_scorers(game.get('home_scorers'))
+    away_scorers = parse_scorers(game.get('away_scorers'))
 
     lines = []
-    lines.append(f"*{stage}*")
-    lines.append(f"{home} {home_score} - {away_score} {away}")
-    if minute:
-        lines.append(f"_Minute: {minute}'_")
-    lines.append(f"Status: {status}")
+    lines.append(f"*skibtracker ⚽ {gtype}*")
+    lines.append(f"*{home} {hs} - {as_} {away}*")
 
-    if goals:
-        lines.append("\n*Goals:*")
-        for g in goals:
-            player = g.get("player", "Unknown")
-            team = g.get("team", "")
-            min_ = g.get("minute", "?")
-            gtype = "⚽" if g.get("type") == "goal" else ("🔴 OG" if g.get("type") == "own_goal" else "🎯 PEN")
-            lines.append(f"{gtype} {player} ({team}) {min_}'")
+    new_home = hs - prev_home_score
+    new_away = as_ - prev_away_score
 
-    if cards:
-        lines.append("\n*Red Cards:*")
-        for c in cards:
-            player = c.get("player", "Unknown")
-            team = c.get("team", "")
-            min_ = c.get("minute", "?")
-            lines.append(f"🟥 {player} ({team}) {min_}'")
+    if new_home > 0:
+        # Show last N scorers matching new count
+        new_goals = home_scorers[-new_home:] if home_scorers else []
+        for g in new_goals:
+            lines.append(f"⚽ GOAL — {home}: {g}")
 
-    return "\n".join(lines)
+    if new_away > 0:
+        new_goals = away_scorers[-new_away:] if away_scorers else []
+        for g in new_goals:
+            lines.append(f"⚽ GOAL — {away}: {g}")
 
-def run():
-    print(f"[{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}] skibtracker running...")
+    if finished and prev_home_score != -1:
+        lines.append(f"🏁 FINAL WHISTLE")
+
+    return "\n".join(lines) if (new_home > 0 or new_away > 0 or (finished and prev_home_score != -1)) else None
+
+def run(state=None):
+    """
+    state: dict of {game_id: {home_score, away_score, finished}}
+    Returns (alert_message or None, new_state)
+    """
+    if state is None:
+        state = {}
+
     try:
-        data = get_all_games()
-        games = data if isinstance(data, list) else data.get("games", data.get("data", []))
-        targets = find_target_games(games)
-
-        if not targets:
-            print("No semi/final matches found yet in API — may not be populated until bracket resolves.")
-            return None
-
-        updates = []
-        for game in targets:
-            status = game.get("status", "")
-            # Only report live or finished games with events
-            if status in ["live", "finished", "halftime", "extra_time", "penalties"]:
-                updates.append(format_event_update(game))
-
-        if updates:
-            return "\n\n---\n\n".join(updates)
-        else:
-            return "No live semi/final matches right now."
-
+        games = get_games()
     except Exception as e:
-        return f"skibtracker error: {e}"
+        return f"skibtracker API error: {e}", state
+
+    target_games = [g for g in games if isinstance(g, dict) and g.get('type', '').lower() in TARGET_TYPES]
+
+    if not target_games:
+        return None, state
+
+    alerts = []
+    new_state = dict(state)
+
+    for game in target_games:
+        gid = str(game.get('id', game.get('_id', '')))
+        hs = int(game.get('home_score', 0) or 0)
+        as_ = int(game.get('away_score', 0) or 0)
+        finished = str(game.get('finished', '')).upper() == 'TRUE'
+
+        prev = state.get(gid, {'home_score': 0, 'away_score': 0, 'finished': False})
+        prev_hs = prev['home_score']
+        prev_as = prev['away_score']
+        prev_fin = prev['finished']
+
+        # Only alert if score changed or match just finished
+        score_changed = (hs != prev_hs or as_ != prev_as)
+        just_finished = finished and not prev_fin
+
+        if score_changed or just_finished:
+            alert = format_alert(game, prev_hs, prev_as)
+            if alert:
+                alerts.append(alert)
+
+        new_state[gid] = {'home_score': hs, 'away_score': as_, 'finished': finished}
+
+    return ("\n\n---\n\n".join(alerts) if alerts else None), new_state
+
 
 if __name__ == "__main__":
-    result = run()
-    if result:
-        print(result)
+    msg, _ = run()
+    print(msg if msg else "No new events right now.")
+
+    # Also print current semi/final status
+    print("\n=== Current Semi/Final Status ===")
+    games = get_games()
+    for g in games:
+        if isinstance(g, dict) and g.get('type', '').lower() in TARGET_TYPES:
+            home = g.get('home_team_name_en', 'TBD')
+            away = g.get('away_team_name_en', 'TBD')
+            hs = g.get('home_score', '0')
+            as_ = g.get('away_score', '0')
+            gtype = g.get('type','').upper()
+            date = g.get('local_date','')
+            fin = g.get('finished','')
+            hs_scorers = parse_scorers(g.get('home_scorers'))
+            as_scorers = parse_scorers(g.get('away_scorers'))
+            print(f"[{gtype}] {home} {hs}-{as_} {away} | {date} | Finished:{fin}")
+            if hs_scorers: print(f"  {home}: {hs_scorers}")
+            if as_scorers: print(f"  {away}: {as_scorers}")
